@@ -20,10 +20,7 @@ import java.beans.Introspector
 import java.lang.reflect.ParameterizedType
 import java.lang.reflect.Type
 import kotlin.reflect.*
-import kotlin.reflect.full.createType
-import kotlin.reflect.full.declaredMemberProperties
-import kotlin.reflect.full.isSubclassOf
-import kotlin.reflect.full.superclasses
+import kotlin.reflect.full.*
 import kotlin.reflect.jvm.javaType
 
 /**
@@ -120,7 +117,30 @@ class TypeScriptGenerator(
 
     private fun formatKType(kType: KType): TypeScriptType {
         val classifier = kType.classifier
+
         if (classifier is KClass<*>) {
+            if (classifier.qualifiedName?.startsWith("kotlin.Function") == true) {
+                val typeArgs = kType.arguments
+
+                val sb = StringBuilder()
+
+                sb.append("(")
+                for (arg in typeArgs.dropLast(1)) {
+                    arg.type?.findAnnotation<ParameterName>()?.let {
+                        sb.append(it.name)
+                        sb.append(": ")
+                    }
+
+                    sb.append(arg.type?.let { formatKType(it) }?.formatWithoutParenthesis() ?: "any")
+                }
+                sb.append(") => ")
+
+                val returnType = typeArgs.last()
+                sb.append(returnType.type?.let { formatKType(it) }?.formatWithoutParenthesis() ?: "any")
+
+                return TypeScriptType.single(sb.toString(), kType.isMarkedNullable, voidType)
+            }
+
             val existingMapping = mappings[classifier]
             if (existingMapping != null) {
                 return TypeScriptType.single(mappings[classifier]!!, kType.isMarkedNullable, voidType)
@@ -129,19 +149,20 @@ class TypeScriptGenerator(
 
         val classifierTsType = when (classifier) {
             Boolean::class -> "boolean"
-            String::class, Char::class -> "string"
+            String::class, Char::class, CharSequence::class -> "string"
             Int::class,
             Long::class,
             Short::class,
             Byte::class -> intTypeName
             Float::class, Double::class -> "number"
             Any::class -> "any"
+            Unit::class -> "void"
             else -> {
                 @Suppress("IfThenToElvis")
                 if (classifier is KClass<*>) {
                     if (classifier.isSubclassOf(Iterable::class)
-                        || classifier.javaObjectType.isArray)
-                    {
+                        || classifier.javaObjectType.isArray
+                    ) {
                         // Use native JS array
                         // Parenthesis are needed to disambiguate complex cases,
                         // e.g. (Pair<string|null, int>|null)[]|null
@@ -157,14 +178,14 @@ class TypeScriptGenerator(
                             DoubleArray::class -> Double::class.createType(nullable = false)
 
                             // Class container types (they use generics)
-                            else -> kType.arguments.single().type ?: KotlinAnyOrNull
+                            else -> kType.arguments.singleOrNull()?.type ?: KotlinAnyOrNull
                         }
                         "${formatKType(itemType).formatWithParenthesis()}[]"
                     } else if (classifier.isSubclassOf(Map::class)) {
                         // Use native JS associative object
-                        val rawKeyType = kType.arguments[0].type ?: KotlinAnyOrNull
+                        val rawKeyType = kType.arguments.getOrNull(0)?.type ?: KotlinAnyOrNull
                         val keyType = formatKType(rawKeyType)
-                        val valueType = formatKType(kType.arguments[1].type ?: KotlinAnyOrNull)
+                        val valueType = formatKType(kType.arguments.getOrNull(1)?.type ?: KotlinAnyOrNull)
                         if ((rawKeyType.classifier as? KClass<*>)?.java?.isEnum == true)
                             "{ [key in ${keyType.formatWithoutParenthesis()}]: ${valueType.formatWithoutParenthesis()} }"
                         else
@@ -227,29 +248,49 @@ class TypeScriptGenerator(
         }
 
         return "interface ${klass.simpleName}$templateParameters$extendsString {\n" +
-            klass.declaredMemberProperties
-                .filter { !isFunctionType(it.returnType.javaType) }
-                .filter {
-                    it.visibility == KVisibility.PUBLIC || isJavaBeanProperty(it, klass)
-                }
-                .let { propertyList ->
-                    pipeline.transformPropertyList(propertyList, klass)
-                }
-                .map { property ->
-                    val propertyName = pipeline.transformPropertyName(property.name, property, klass)
-                    val propertyType = pipeline.transformPropertyType(property.returnType, property, klass)
+                klass.declaredMemberProperties
+                    .filter { !isFunctionType(it.returnType.javaType) }
+                    .filter {
+                        it.visibility == KVisibility.PUBLIC || isJavaBeanProperty(it, klass)
+                    }
+                    .let { propertyList ->
+                        pipeline.transformPropertyList(propertyList, klass)
+                    }
+                    .map { property ->
+                        val propertyName = pipeline.transformPropertyName(property.name, property, klass)
+                        val propertyType = pipeline.transformPropertyType(property.returnType, property, klass)
 
-                    val formattedPropertyType = formatKType(propertyType).formatWithoutParenthesis()
-                    "    $propertyName: $formattedPropertyType;\n"
-                }
-                .joinToString("") +
-            "}"
+                        val formattedPropertyType = formatKType(propertyType).formatWithoutParenthesis()
+                        "    $propertyName: $formattedPropertyType;\n"
+                    }
+                    .joinToString("") +
+                    try {
+                        // TODO: support function types
+                        klass.declaredMemberFunctions
+                            // TODO: support function types
+                            .filter { it.visibility == KVisibility.PUBLIC }
+                            .mapNotNull { func ->
+                                try {
+                                    val funcName = func.name
+
+                                    val params = func.parameters.filter { it.name != null }
+                                        .map { "${it.name}${if (it.isOptional) "?" else ""}: ${formatKType(it.type).formatWithoutParenthesis()}" }
+                                    val returnType = formatKType(func.returnType).formatWithoutParenthesis()
+
+                                    "    $funcName(${params.joinToString()}): $returnType;\n"
+                                } catch (e: Throwable) {
+                                    null
+                                }
+                            }.joinToString("")
+                    } catch (e: Throwable) {
+                        ""
+                    } + "}"
     }
 
     private fun isFunctionType(javaType: Type): Boolean {
         return javaType is KCallable<*>
-            || javaType.typeName.startsWith("kotlin.jvm.functions.")
-            || (javaType is ParameterizedType && isFunctionType(javaType.rawType))
+                || javaType.typeName.startsWith("kotlin.jvm.functions.")
+                || (javaType is ParameterizedType && isFunctionType(javaType.rawType))
     }
 
     private fun generateDefinition(klass: KClass<*>): String {
